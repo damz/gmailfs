@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -26,13 +27,14 @@ func TestSlugify(t *testing.T) {
 }
 
 func TestSlugifyTruncation(t *testing.T) {
-	long := ""
+	var b strings.Builder
 	for i := range 20 {
 		if i > 0 {
-			long += "-"
+			b.WriteString("-")
 		}
-		long += "abcde"
+		b.WriteString("abcde")
 	}
+	long := b.String()
 	got := slugify(long)
 	require.LessOrEqual(t, len(got), 80)
 }

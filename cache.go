@@ -284,11 +284,12 @@ func (c *Cache) FlushDays(labelID string, dates []time.Time) error {
 	flushYears := false
 	if len(newMonthYears) > 0 {
 		cachedYears, err := c.GetPopulatedYears(labelID)
-		if err == pebble.ErrNotFound {
+		switch {
+		case err == pebble.ErrNotFound:
 			flushYears = true
-		} else if err != nil {
+		case err != nil:
 			return err
-		} else {
+		default:
 			yearSet := make(map[int]bool, len(cachedYears))
 			for _, y := range cachedYears {
 				yearSet[y] = true

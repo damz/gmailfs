@@ -198,36 +198,8 @@ func (g *GmailClient) listMessageIDs(ctx context.Context, labelID string, afterE
 
 // Cost: O(populated_years + 1) API calls.
 func (g *GmailClient) PopulatedYears(ctx context.Context, labelID string, cache *Cache) ([]int, error) {
-	if err := g.limiter.Wait(ctx); err != nil {
-		return nil, err
-	}
-
-	slog.Debug("gmail API", slog.String("method", "messages.list"), slog.String("label", labelID), slog.String("q", "(newest)"))
-	resp, err := g.messagesList(labelID).
-		MaxResults(1).
-		Context(ctx).
-		Do()
-	if err != nil {
-		return nil, fmt.Errorf("finding newest message: %w", err)
-	}
-
-	if len(resp.Messages) == 0 {
-		return nil, nil
-	}
-
-	stubs, err := g.GetMessageStubs(ctx, []string{resp.Messages[0].Id}, cache)
-	if err != nil {
-		return nil, err
-	}
-
-	stub, ok := stubs[resp.Messages[0].Id]
-	if !ok {
-		return nil, nil
-	}
-
-	// Scan backwards from the newest message's year.
 	var years []int
-	cursor := time.Date(time.UnixMilli(stub.InternalDate).In(time.Local).Year()+1, 1, 1, 0, 0, 0, 0, time.Local).Unix()
+	cursor := time.Now().AddDate(1, 0, 0).Unix()
 	for {
 		s, found, err := g.newestMessageInRange(ctx, labelID, 0, cursor, cache)
 		if err != nil {

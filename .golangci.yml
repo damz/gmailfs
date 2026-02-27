@@ -1,0 +1,25 @@
+version: "2"
+
+linters:
+  enable:
+    - depguard
+    - errname
+    - gocritic
+    - modernize
+    - nolintlint
+    - sloglint
+    - testifylint
+    - unconvert
+  settings:
+    depguard:
+      rules:
+        no-log:
+          deny:
+            - pkg: "log$"
+              desc: use log/slog instead
+    sloglint:
+      attr-only: true
+
+formatters:
+  enable:
+    - goimports

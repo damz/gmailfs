@@ -444,6 +444,9 @@ func (n *emlNode) getRawContent(ctx context.Context) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if raw == nil {
+		return nil, nil // message not fetchable
+	}
 
 	if cerr := n.fsCtx.cache.SetRawMessage(n.stub.ID, raw); cerr != nil {
 		slog.Warn("cache write error", slog.String("msgID", n.stub.ID), slog.Any("err", cerr))

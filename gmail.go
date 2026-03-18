@@ -20,6 +20,36 @@ import (
 
 const AllMailLabelID = "_all_"
 
+// isRetryable returns true for transient API errors worth retrying.
+func isRetryable(err error) bool {
+	var apiErr *googleapi.Error
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	return apiErr.Code >= 500 || apiErr.Code == http.StatusTooManyRequests ||
+		apiErr.Code == http.StatusBadRequest // transient failedPrecondition
+}
+
+// retryDo calls fn up to 3 times on retryable errors, with exponential backoff.
+func retryDo[T any](ctx context.Context, fn func() (T, error)) (T, error) {
+	const maxAttempts = 3
+	var zero T
+	for attempt := range maxAttempts {
+		result, err := fn()
+		if err == nil || !isRetryable(err) || attempt == maxAttempts-1 {
+			return result, err
+		}
+		delay := time.Duration(1<<attempt) * time.Second
+		slog.Warn("retrying after server error", slog.Any("err", err), slog.Duration("backoff", delay))
+		select {
+		case <-ctx.Done():
+			return zero, ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+	return zero, nil // unreachable
+}
+
 type stubCache interface {
 	GetMessageStub(string) (MessageStub, error)
 	SetMessageStub(MessageStub) error
@@ -297,16 +327,21 @@ func (g *GmailClient) ListDayMessages(ctx context.Context, labelID string, year,
 }
 
 func (g *GmailClient) GetRawMessage(ctx context.Context, messageID string) ([]byte, error) {
-	if err := g.limiter.Wait(ctx); err != nil {
-		return nil, err
-	}
-
-	slog.Debug("gmail API", slog.String("method", "messages.get"), slog.String("id", messageID), slog.String("format", "raw"))
-	msg, err := g.svc.Users.Messages.Get(g.user, messageID).
-		Format("raw").
-		Context(ctx).
-		Do()
+	msg, err := retryDo(ctx, func() (*gmail.Message, error) {
+		if err := g.limiter.Wait(ctx); err != nil {
+			return nil, err
+		}
+		slog.Debug("gmail API", slog.String("method", "messages.get"), slog.String("id", messageID), slog.String("format", "raw"))
+		return g.svc.Users.Messages.Get(g.user, messageID).
+			Format("raw").
+			Context(ctx).
+			Do()
+	})
 	if err != nil {
+		var apiErr *googleapi.Error
+		if errors.As(err, &apiErr) && apiErr.Code == http.StatusNotFound {
+			return nil, nil
+		}
 		return nil, fmt.Errorf("getting raw message %s: %w", messageID, err)
 	}
 
@@ -457,12 +492,14 @@ func (g *GmailClient) GetMessageStubs(ctx context.Context, messageIDs []string, 
 		}
 
 		wg.Go(func() {
-			slog.Debug("gmail API", slog.String("method", "messages.get"), slog.String("id", id), slog.String("format", "metadata"))
-			msg, err := g.svc.Users.Messages.Get(g.user, id).
-				Format("metadata").
-				MetadataHeaders("Subject").
-				Context(ctx).
-				Do()
+			msg, err := retryDo(ctx, func() (*gmail.Message, error) {
+				slog.Debug("gmail API", slog.String("method", "messages.get"), slog.String("id", id), slog.String("format", "metadata"))
+				return g.svc.Users.Messages.Get(g.user, id).
+					Format("metadata").
+					MetadataHeaders("Subject").
+					Context(ctx).
+					Do()
+			})
 			if err != nil {
 				var apiErr *googleapi.Error
 				if errors.As(err, &apiErr) && apiErr.Code == http.StatusNotFound {

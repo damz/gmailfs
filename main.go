@@ -95,7 +95,9 @@ func run() error {
 	}
 	slog.Info("loaded labels", slog.Int("count", len(labels)))
 
-	if _, err := syncHistory(ctx, gmailClient, cache); err != nil {
+	index := NewLabelIndex(gmailClient, cache)
+
+	if _, err := syncHistory(ctx, gmailClient, cache, index); err != nil {
 		return fmt.Errorf("history sync: %w", err)
 	}
 

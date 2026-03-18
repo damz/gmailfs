@@ -2,7 +2,6 @@ package main
 
 import (
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -28,53 +27,6 @@ func TestLabels(t *testing.T) {
 	got, err = c.GetLabels()
 	require.NoError(t, err)
 	require.Equal(t, labels, got)
-}
-
-func TestPopulatedYears(t *testing.T) {
-	c := newTestCache(t)
-
-	_, err := c.GetPopulatedYears("INBOX")
-	require.Error(t, err)
-
-	require.NoError(t, c.SetPopulatedYears("INBOX", []int{2024, 2025, 2026}))
-
-	years, err := c.GetPopulatedYears("INBOX")
-	require.NoError(t, err)
-	require.Equal(t, []int{2024, 2025, 2026}, years)
-}
-
-func TestPopulatedMonths(t *testing.T) {
-	c := newTestCache(t)
-
-	require.NoError(t, c.SetPopulatedMonths("INBOX", 2026, []int{1, 2}))
-
-	months, err := c.GetPopulatedMonths("INBOX", 2026)
-	require.NoError(t, err)
-	require.Equal(t, []int{1, 2}, months)
-}
-
-func TestPopulatedDays(t *testing.T) {
-	c := newTestCache(t)
-
-	require.NoError(t, c.SetPopulatedDays("INBOX", 2026, 2, []int{15, 27}))
-
-	days, err := c.GetPopulatedDays("INBOX", 2026, 2)
-	require.NoError(t, err)
-	require.Equal(t, []int{15, 27}, days)
-}
-
-func TestDayListing(t *testing.T) {
-	c := newTestCache(t)
-
-	stubs := []MessageStub{
-		{ID: "msg1", InternalDate: 1000, Subject: "Hello", SizeEstimate: 512},
-		{ID: "msg2", InternalDate: 2000, Subject: "World", SizeEstimate: 1024},
-	}
-	require.NoError(t, c.SetDayListing("INBOX", 2026, 2, 27, stubs))
-
-	got, err := c.GetDayListing("INBOX", 2026, 2, 27)
-	require.NoError(t, err)
-	require.Equal(t, stubs, got)
 }
 
 func TestMessageStub(t *testing.T) {
@@ -136,104 +88,132 @@ func TestCheckTimezone(t *testing.T) {
 func TestFlushListings(t *testing.T) {
 	c := newTestCache(t)
 
-	require.NoError(t, c.SetPopulatedYears("INBOX", []int{2026}))
-	require.NoError(t, c.SetPopulatedMonths("INBOX", 2026, []int{2}))
-	require.NoError(t, c.SetPopulatedDays("INBOX", 2026, 2, []int{27}))
-	require.NoError(t, c.SetDayListing("INBOX", 2026, 2, 27, []MessageStub{{ID: "m1"}}))
+	require.NoError(t, c.SetDayIndex("INBOX", 2026, 2, 15, []string{"msg1"}))
+	require.NoError(t, c.SetLabelIndexComplete("INBOX"))
+	require.NoError(t, c.SetDayIndex("SENT", 2026, 1, 1, []string{"msg2"}))
+	require.NoError(t, c.SetLabelIndexComplete("SENT"))
 
 	require.NoError(t, c.FlushListings())
 
-	_, err := c.GetPopulatedYears("INBOX")
+	require.False(t, c.IsLabelIndexComplete("INBOX"))
+	require.False(t, c.IsLabelIndexComplete("SENT"))
+	_, err := c.GetDayIndex("INBOX", 2026, 2, 15)
 	require.Error(t, err)
-
-	_, err = c.GetPopulatedMonths("INBOX", 2026)
-	require.Error(t, err)
-
-	_, err = c.GetPopulatedDays("INBOX", 2026, 2)
-	require.Error(t, err)
-
-	_, err = c.GetDayListing("INBOX", 2026, 2, 27)
-	require.Error(t, err)
-}
-
-func TestFlushDays(t *testing.T) {
-	c := newTestCache(t)
-
-	require.NoError(t, c.SetPopulatedYears("INBOX", []int{2026}))
-	require.NoError(t, c.SetPopulatedMonths("INBOX", 2026, []int{2}))
-	require.NoError(t, c.SetPopulatedDays("INBOX", 2026, 2, []int{15, 27}))
-	require.NoError(t, c.SetDayListing("INBOX", 2026, 2, 15, []MessageStub{{ID: "m1"}}))
-	require.NoError(t, c.SetDayListing("INBOX", 2026, 2, 27, []MessageStub{{ID: "m2"}}))
-
-	// Flush day 27 — already in cached days list, so parents stay.
-	dates := []time.Time{time.Date(2026, 2, 27, 12, 0, 0, 0, time.Local)}
-	require.NoError(t, c.FlushDays("INBOX", dates))
-
-	_, err := c.GetDayListing("INBOX", 2026, 2, 27)
-	require.Error(t, err)
-
-	// Day 15 listing untouched.
-	stubs, err := c.GetDayListing("INBOX", 2026, 2, 15)
-	require.NoError(t, err)
-	require.Len(t, stubs, 1)
-
-	// Parents not flushed since day 27 was already known.
-	days, err := c.GetPopulatedDays("INBOX", 2026, 2)
-	require.NoError(t, err)
-	require.Equal(t, []int{15, 27}, days)
 }
 
 func TestFlushLabel(t *testing.T) {
 	c := newTestCache(t)
 
-	require.NoError(t, c.SetPopulatedYears("INBOX", []int{2026}))
-	require.NoError(t, c.SetPopulatedMonths("INBOX", 2026, []int{2}))
-	require.NoError(t, c.SetPopulatedDays("INBOX", 2026, 2, []int{15, 27}))
-	require.NoError(t, c.SetDayListing("INBOX", 2026, 2, 15, []MessageStub{{ID: "m1"}}))
+	require.NoError(t, c.SetDayIndex("INBOX", 2026, 2, 15, []string{"m1"}))
+	require.NoError(t, c.SetLabelIndexComplete("INBOX"))
 
 	// Another label should be untouched.
-	require.NoError(t, c.SetPopulatedYears("SENT", []int{2025}))
+	require.NoError(t, c.SetDayIndex("SENT", 2025, 1, 1, []string{"m2"}))
+	require.NoError(t, c.SetLabelIndexComplete("SENT"))
 
 	require.NoError(t, c.FlushLabel("INBOX"))
 
-	_, err := c.GetPopulatedYears("INBOX")
-	require.Error(t, err)
-
-	_, err = c.GetPopulatedMonths("INBOX", 2026)
-	require.Error(t, err)
-
-	_, err = c.GetPopulatedDays("INBOX", 2026, 2)
-	require.Error(t, err)
-
-	_, err = c.GetDayListing("INBOX", 2026, 2, 15)
+	require.False(t, c.IsLabelIndexComplete("INBOX"))
+	_, err := c.GetDayIndex("INBOX", 2026, 2, 15)
 	require.Error(t, err)
 
 	// SENT untouched.
-	years, err := c.GetPopulatedYears("SENT")
+	require.True(t, c.IsLabelIndexComplete("SENT"))
+	ids, err := c.GetDayIndex("SENT", 2025, 1, 1)
 	require.NoError(t, err)
-	require.Equal(t, []int{2025}, years)
+	require.Equal(t, []string{"m2"}, ids)
 }
 
-func TestFlushDaysNewDay(t *testing.T) {
+func TestDayIndex(t *testing.T) {
 	c := newTestCache(t)
 
-	require.NoError(t, c.SetPopulatedYears("INBOX", []int{2026}))
-	require.NoError(t, c.SetPopulatedMonths("INBOX", 2026, []int{2}))
-	require.NoError(t, c.SetPopulatedDays("INBOX", 2026, 2, []int{15}))
-
-	// Flush day 20 — not in cached days, so parents get flushed too.
-	dates := []time.Time{time.Date(2026, 2, 20, 12, 0, 0, 0, time.Local)}
-	require.NoError(t, c.FlushDays("INBOX", dates))
-
-	_, err := c.GetPopulatedDays("INBOX", 2026, 2)
+	// Not found initially.
+	_, err := c.GetDayIndex("INBOX", 2026, 2, 15)
 	require.Error(t, err)
 
-	// Months and years not flushed since month 2 and year 2026 were already known.
-	months, err := c.GetPopulatedMonths("INBOX", 2026)
+	// Set and retrieve.
+	require.NoError(t, c.SetDayIndex("INBOX", 2026, 2, 15, []string{"msg1", "msg2"}))
+	ids, err := c.GetDayIndex("INBOX", 2026, 2, 15)
 	require.NoError(t, err)
-	require.Equal(t, []int{2}, months)
+	require.Equal(t, []string{"msg1", "msg2"}, ids)
 
-	years, err := c.GetPopulatedYears("INBOX")
+	// Add a new ID.
+	require.NoError(t, c.AddToDayIndex("INBOX", 2026, 2, 15, "msg3"))
+	ids, err = c.GetDayIndex("INBOX", 2026, 2, 15)
 	require.NoError(t, err)
-	require.Equal(t, []int{2026}, years)
+	require.Equal(t, []string{"msg1", "msg2", "msg3"}, ids)
+
+	// Add duplicate — no-op.
+	require.NoError(t, c.AddToDayIndex("INBOX", 2026, 2, 15, "msg2"))
+	ids, err = c.GetDayIndex("INBOX", 2026, 2, 15)
+	require.NoError(t, err)
+	require.Equal(t, []string{"msg1", "msg2", "msg3"}, ids)
+
+	// Remove.
+	require.NoError(t, c.RemoveFromDayIndex("INBOX", 2026, 2, 15, "msg2"))
+	ids, err = c.GetDayIndex("INBOX", 2026, 2, 15)
+	require.NoError(t, err)
+	require.Equal(t, []string{"msg1", "msg3"}, ids)
+
+	// Remove last entries — key deleted.
+	require.NoError(t, c.RemoveFromDayIndex("INBOX", 2026, 2, 15, "msg1"))
+	require.NoError(t, c.RemoveFromDayIndex("INBOX", 2026, 2, 15, "msg3"))
+	_, err = c.GetDayIndex("INBOX", 2026, 2, 15)
+	require.Error(t, err)
+}
+
+func TestIndexedYearsMonthsDays(t *testing.T) {
+	c := newTestCache(t)
+
+	// Populate index across multiple years/months/days.
+	require.NoError(t, c.SetDayIndex("INBOX", 2024, 3, 10, []string{"a"}))
+	require.NoError(t, c.SetDayIndex("INBOX", 2024, 11, 5, []string{"b"}))
+	require.NoError(t, c.SetDayIndex("INBOX", 2026, 2, 15, []string{"c", "d"}))
+	require.NoError(t, c.SetDayIndex("INBOX", 2026, 2, 27, []string{"e"}))
+	require.NoError(t, c.SetDayIndex("INBOX", 2026, 7, 1, []string{"f"}))
+
+	// Years.
+	years, err := c.IndexedYears("INBOX")
+	require.NoError(t, err)
+	require.Equal(t, []int{2024, 2026}, years)
+
+	// Months.
+	months, err := c.IndexedMonths("INBOX", 2026)
+	require.NoError(t, err)
+	require.Equal(t, []int{2, 7}, months)
+
+	months, err = c.IndexedMonths("INBOX", 2024)
+	require.NoError(t, err)
+	require.Equal(t, []int{3, 11}, months)
+
+	// Days.
+	days, err := c.IndexedDays("INBOX", 2026, 2)
+	require.NoError(t, err)
+	require.Equal(t, []int{15, 27}, days)
+
+	// Empty results for non-existent data.
+	years, err = c.IndexedYears("SENT")
+	require.NoError(t, err)
+	require.Nil(t, years)
+}
+
+func TestDayStubsFromIndex(t *testing.T) {
+	c := newTestCache(t)
+
+	// Populate stubs and index.
+	s1 := MessageStub{ID: "msg1", InternalDate: 2000, Subject: "Second", SizeEstimate: 100}
+	s2 := MessageStub{ID: "msg2", InternalDate: 1000, Subject: "First", SizeEstimate: 200}
+	require.NoError(t, c.SetMessageStub(s1))
+	require.NoError(t, c.SetMessageStub(s2))
+	require.NoError(t, c.SetDayIndex("INBOX", 2026, 2, 15, []string{"msg1", "msg2"}))
+
+	stubs, err := c.DayStubsFromIndex("INBOX", 2026, 2, 15)
+	require.NoError(t, err)
+	// Should be sorted by InternalDate.
+	require.Equal(t, []MessageStub{s2, s1}, stubs)
+
+	// Empty day returns nil stubs.
+	stubs, err = c.DayStubsFromIndex("INBOX", 2026, 2, 20)
+	require.NoError(t, err)
+	require.Nil(t, stubs)
 }

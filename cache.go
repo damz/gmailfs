@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"sort"
 	"strconv"
-	"time"
 
 	"github.com/cockroachdb/pebble/v2"
 )
@@ -66,78 +66,6 @@ func (c *Cache) GetLabels() ([]LabelInfo, error) {
 
 func (c *Cache) SetLabels(labels []LabelInfo) error {
 	return c.setJSON([]byte("labels"), labels)
-}
-
-func populatedDaysKey(labelID string, year, month int) []byte {
-	return fmt.Appendf(nil, "days:%s:%04d:%02d", labelID, year, month)
-}
-
-func (c *Cache) GetPopulatedDays(labelID string, year, month int) ([]int, error) {
-	var days []int
-	err := c.getJSON(populatedDaysKey(labelID, year, month), &days)
-	return days, err
-}
-
-func (c *Cache) SetPopulatedDays(labelID string, year, month int, days []int) error {
-	if days == nil {
-		days = []int{}
-	}
-
-	return c.setJSON(populatedDaysKey(labelID, year, month), days)
-}
-
-func populatedYearsKey(labelID string) []byte {
-	return fmt.Appendf(nil, "years:%s", labelID)
-}
-
-func (c *Cache) GetPopulatedYears(labelID string) ([]int, error) {
-	var years []int
-	err := c.getJSON(populatedYearsKey(labelID), &years)
-	return years, err
-}
-
-func (c *Cache) SetPopulatedYears(labelID string, years []int) error {
-	if years == nil {
-		years = []int{}
-	}
-
-	return c.setJSON(populatedYearsKey(labelID), years)
-}
-
-func populatedMonthsKey(labelID string, year int) []byte {
-	return fmt.Appendf(nil, "months:%s:%04d", labelID, year)
-}
-
-func (c *Cache) GetPopulatedMonths(labelID string, year int) ([]int, error) {
-	var months []int
-	err := c.getJSON(populatedMonthsKey(labelID, year), &months)
-	return months, err
-}
-
-func (c *Cache) SetPopulatedMonths(labelID string, year int, months []int) error {
-	if months == nil {
-		months = []int{}
-	}
-
-	return c.setJSON(populatedMonthsKey(labelID, year), months)
-}
-
-func dayKey(labelID string, year, month, day int) []byte {
-	return fmt.Appendf(nil, "day:%s:%04d:%02d:%02d", labelID, year, month, day)
-}
-
-func (c *Cache) GetDayListing(labelID string, year, month, day int) ([]MessageStub, error) {
-	var stubs []MessageStub
-	err := c.getJSON(dayKey(labelID, year, month, day), &stubs)
-	return stubs, err
-}
-
-func (c *Cache) SetDayListing(labelID string, year, month, day int, stubs []MessageStub) error {
-	if stubs == nil {
-		stubs = []MessageStub{}
-	}
-
-	return c.setJSON(dayKey(labelID, year, month, day), stubs)
 }
 
 func stubKey(messageID string) []byte {
@@ -219,139 +147,17 @@ func (c *Cache) CheckTimezone(tz string) (bool, error) {
 	return true, c.db.Set([]byte("meta:timezone"), []byte(tz), pebble.Sync)
 }
 
-// FlushListings deletes all cached listings (days, months, years) across all labels.
+// FlushListings deletes all cached indexes across all labels.
 func (c *Cache) FlushListings() error {
-	return c.deleteByPrefixes("day:", "days:", "months:", "years:")
+	return c.deleteByPrefixes("idx:", "idx-done:")
 }
 
-// FlushDays deletes cache entries for specific days. Parent listings are only
-// flushed when an affected date isn't already in the cached listing, since a
-// new day/month/year may have appeared.
-func (c *Cache) FlushDays(labelID string, dates []time.Time) error {
-	type dayKey struct{ y, m, d int }
-	type monthKey struct{ y, m int }
-
-	allDays := make(map[dayKey]struct{})
-	for _, t := range dates {
-		y, m, d := t.Date()
-		allDays[dayKey{y, int(m), d}] = struct{}{}
-	}
-
-	// Determine which months have a potentially new day.
-	newDayMonths := make(map[monthKey]struct{})
-	for dk := range allDays {
-		mk := monthKey{dk.y, dk.m}
-		if _, already := newDayMonths[mk]; already {
-			continue
-		}
-
-		cachedDays, err := c.GetPopulatedDays(labelID, dk.y, dk.m)
-		if err == pebble.ErrNotFound {
-			newDayMonths[mk] = struct{}{}
-			continue
-		}
-		if err != nil {
-			return err
-		}
-
-		if !slices.Contains(cachedDays, dk.d) {
-			newDayMonths[mk] = struct{}{}
-		}
-	}
-
-	// Determine which years have a potentially new month.
-	newMonthYears := make(map[int]struct{})
-	for mk := range newDayMonths {
-		if _, already := newMonthYears[mk.y]; already {
-			continue
-		}
-
-		cachedMonths, err := c.GetPopulatedMonths(labelID, mk.y)
-		if err == pebble.ErrNotFound {
-			newMonthYears[mk.y] = struct{}{}
-			continue
-		}
-		if err != nil {
-			return err
-		}
-
-		if !slices.Contains(cachedMonths, mk.m) {
-			newMonthYears[mk.y] = struct{}{}
-		}
-	}
-
-	// Determine whether the years list itself needs flushing.
-	flushYears := false
-	if len(newMonthYears) > 0 {
-		cachedYears, err := c.GetPopulatedYears(labelID)
-		switch {
-		case err == pebble.ErrNotFound:
-			flushYears = true
-		case err != nil:
-			return err
-		default:
-			yearSet := make(map[int]bool, len(cachedYears))
-			for _, y := range cachedYears {
-				yearSet[y] = true
-			}
-			for y := range newMonthYears {
-				if !yearSet[y] {
-					flushYears = true
-					break
-				}
-			}
-		}
-	}
-
-	batch := c.db.NewBatch()
-
-	for dk := range allDays {
-		key := fmt.Appendf(nil, "day:%s:%04d:%02d:%02d", labelID, dk.y, dk.m, dk.d)
-		slog.Debug("cache flush", slog.String("key", string(key)))
-		if err := batch.Delete(key, pebble.Sync); err != nil {
-			return err
-		}
-	}
-
-	for mk := range newDayMonths {
-		key := fmt.Appendf(nil, "days:%s:%04d:%02d", labelID, mk.y, mk.m)
-		slog.Debug("cache flush", slog.String("key", string(key)))
-		if err := batch.Delete(key, pebble.Sync); err != nil {
-			return err
-		}
-	}
-
-	for y := range newMonthYears {
-		key := fmt.Appendf(nil, "months:%s:%04d", labelID, y)
-		slog.Debug("cache flush", slog.String("key", string(key)))
-		if err := batch.Delete(key, pebble.Sync); err != nil {
-			return err
-		}
-	}
-
-	if flushYears {
-		ykey := fmt.Appendf(nil, "years:%s", labelID)
-		slog.Debug("cache flush", slog.String("key", string(ykey)))
-		if err := batch.Delete(ykey, pebble.Sync); err != nil {
-			return err
-		}
-	}
-
-	return batch.Commit(pebble.Sync)
-}
-
-// FlushLabel deletes all cached listings for a specific label.
+// FlushLabel deletes all cached index data for a specific label.
 func (c *Cache) FlushLabel(labelID string) error {
-	if err := c.deleteByPrefixes(
-		fmt.Sprintf("day:%s:", labelID),
-		fmt.Sprintf("days:%s:", labelID),
-		fmt.Sprintf("months:%s:", labelID),
-	); err != nil {
+	if err := c.deleteByPrefixes(fmt.Sprintf("idx:%s:", labelID)); err != nil {
 		return err
 	}
-
-	// years key has no trailing colon after labelID.
-	return c.deleteExact(fmt.Sprintf("years:%s", labelID))
+	return c.deleteExact(fmt.Sprintf("idx-done:%s", labelID))
 }
 
 func (c *Cache) deleteExact(key string) error {
@@ -377,4 +183,184 @@ func (c *Cache) deleteByPrefixes(prefixes ...string) error {
 		}
 	}
 	return batch.Commit(pebble.Sync)
+}
+
+// --- Day index: idx:<labelID>:<YYYY>:<MM>:<DD> → JSON []string (message IDs) ---
+
+func dayIndexKey(labelID string, year, month, day int) []byte {
+	return fmt.Appendf(nil, "idx:%s:%04d:%02d:%02d", labelID, year, month, day)
+}
+
+func (c *Cache) GetDayIndex(labelID string, year, month, day int) ([]string, error) {
+	var ids []string
+	err := c.getJSON(dayIndexKey(labelID, year, month, day), &ids)
+	return ids, err
+}
+
+func (c *Cache) SetDayIndex(labelID string, year, month, day int, ids []string) error {
+	key := dayIndexKey(labelID, year, month, day)
+	if len(ids) == 0 {
+		err := c.db.Delete(key, pebble.Sync)
+		if err == pebble.ErrNotFound {
+			return nil
+		}
+		return err
+	}
+	return c.setJSON(key, ids)
+}
+
+func (c *Cache) AddToDayIndex(labelID string, year, month, day int, msgID string) error {
+	ids, err := c.GetDayIndex(labelID, year, month, day)
+	if err != nil && err != pebble.ErrNotFound {
+		return err
+	}
+	if slices.Contains(ids, msgID) {
+		return nil
+	}
+	ids = append(ids, msgID)
+	return c.setJSON(dayIndexKey(labelID, year, month, day), ids)
+}
+
+func (c *Cache) RemoveFromDayIndex(labelID string, year, month, day int, msgID string) error {
+	ids, err := c.GetDayIndex(labelID, year, month, day)
+	if err != nil {
+		if err == pebble.ErrNotFound {
+			return nil
+		}
+		return err
+	}
+	filtered := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if id != msgID {
+			filtered = append(filtered, id)
+		}
+	}
+	return c.SetDayIndex(labelID, year, month, day, filtered)
+}
+
+// --- Index completeness marker ---
+
+func indexCompleteKey(labelID string) []byte {
+	return fmt.Appendf(nil, "idx-done:%s", labelID)
+}
+
+func (c *Cache) IsLabelIndexComplete(labelID string) bool {
+	_, closer, err := c.db.Get(indexCompleteKey(labelID))
+	if err != nil {
+		return false
+	}
+	_ = closer.Close()
+	return true
+}
+
+func (c *Cache) SetLabelIndexComplete(labelID string) error {
+	return c.db.Set(indexCompleteKey(labelID), []byte("1"), pebble.Sync)
+}
+
+// --- Prefix-scan derived listings from the day index ---
+
+// IndexedYears returns populated years by scanning day index keys.
+func (c *Cache) IndexedYears(labelID string) ([]int, error) {
+	prefix := fmt.Appendf(nil, "idx:%s:", labelID)
+	iter, err := c.db.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = iter.Close() }()
+
+	var years []int
+	for valid := iter.First(); valid; {
+		suffix := iter.Key()[len(prefix):]
+		year, perr := strconv.Atoi(string(suffix[:4]))
+		if perr != nil {
+			valid = iter.Next()
+			continue
+		}
+		years = append(years, year)
+		valid = iter.SeekGE(fmt.Appendf(nil, "idx:%s:%04d;", labelID, year))
+	}
+	return years, nil
+}
+
+// IndexedMonths returns populated months for a year by scanning day index keys.
+func (c *Cache) IndexedMonths(labelID string, year int) ([]int, error) {
+	prefix := fmt.Appendf(nil, "idx:%s:%04d:", labelID, year)
+	iter, err := c.db.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = iter.Close() }()
+
+	var months []int
+	for valid := iter.First(); valid; {
+		suffix := iter.Key()[len(prefix):]
+		month, perr := strconv.Atoi(string(suffix[:2]))
+		if perr != nil {
+			valid = iter.Next()
+			continue
+		}
+		months = append(months, month)
+		valid = iter.SeekGE(fmt.Appendf(nil, "idx:%s:%04d:%02d;", labelID, year, month))
+	}
+	return months, nil
+}
+
+// IndexedDays returns populated days for a year/month by scanning day index keys.
+func (c *Cache) IndexedDays(labelID string, year, month int) ([]int, error) {
+	prefix := fmt.Appendf(nil, "idx:%s:%04d:%02d:", labelID, year, month)
+	iter, err := c.db.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = iter.Close() }()
+
+	var days []int
+	for valid := iter.First(); valid; valid = iter.Next() {
+		suffix := iter.Key()[len(prefix):]
+		day, perr := strconv.Atoi(string(suffix[:2]))
+		if perr != nil {
+			continue
+		}
+		days = append(days, day)
+	}
+	return days, nil
+}
+
+// DayStubsFromIndex returns MessageStubs for a day by looking up the index
+// then resolving each stub individually.
+func (c *Cache) DayStubsFromIndex(labelID string, year, month, day int) ([]MessageStub, error) {
+	ids, err := c.GetDayIndex(labelID, year, month, day)
+	if err != nil {
+		if err == pebble.ErrNotFound {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	stubs := make([]MessageStub, 0, len(ids))
+	for _, id := range ids {
+		stub, serr := c.GetMessageStub(id)
+		if serr != nil {
+			return nil, fmt.Errorf("resolving stub %s: %w", id, serr)
+		}
+		stubs = append(stubs, stub)
+	}
+	sort.Slice(stubs, func(i, j int) bool { return stubs[i].InternalDate < stubs[j].InternalDate })
+	return stubs, nil
+}
+
+func prefixUpperBound(prefix []byte) []byte {
+	upper := make([]byte, len(prefix))
+	copy(upper, prefix)
+	upper[len(upper)-1]++
+	return upper
 }

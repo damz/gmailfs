@@ -17,6 +17,7 @@ import (
 type fsContext struct {
 	gmail  *GmailClient
 	cache  *Cache
+	index  *LabelIndex
 	labels []LabelInfo
 	root   *fs.Inode
 }
@@ -97,20 +98,7 @@ func (n *labelNode) OpendirHandle(_ context.Context, _ uint32) (fs.FileHandle, u
 }
 
 func (n *labelNode) getPopulatedYears(ctx context.Context) ([]int, error) {
-	years, err := n.fsCtx.cache.GetPopulatedYears(n.label.ID)
-	if err == nil {
-		return years, nil
-	}
-
-	years, err = n.fsCtx.gmail.PopulatedYears(ctx, n.label.ID, n.fsCtx.cache)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := n.fsCtx.cache.SetPopulatedYears(n.label.ID, years); err != nil {
-		slog.Warn("cache write error", slog.Any("err", err))
-	}
-	return years, nil
+	return n.fsCtx.index.Years(ctx, n.label.ID)
 }
 
 func (n *labelNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
@@ -170,20 +158,7 @@ func (n *yearNode) OpendirHandle(_ context.Context, _ uint32) (fs.FileHandle, ui
 }
 
 func (n *yearNode) getPopulatedMonths(ctx context.Context) ([]int, error) {
-	months, err := n.fsCtx.cache.GetPopulatedMonths(n.label.ID, n.year)
-	if err == nil {
-		return months, nil
-	}
-
-	months, err = n.fsCtx.gmail.PopulatedMonths(ctx, n.label.ID, n.year, n.fsCtx.cache)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := n.fsCtx.cache.SetPopulatedMonths(n.label.ID, n.year, months); err != nil {
-		slog.Warn("cache write error", slog.Any("err", err))
-	}
-	return months, nil
+	return n.fsCtx.index.Months(ctx, n.label.ID, n.year)
 }
 
 func (n *yearNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
@@ -244,20 +219,7 @@ func (n *monthNode) OpendirHandle(_ context.Context, _ uint32) (fs.FileHandle, u
 }
 
 func (n *monthNode) getPopulatedDays(ctx context.Context) ([]int, error) {
-	days, err := n.fsCtx.cache.GetPopulatedDays(n.label.ID, n.year, n.month)
-	if err == nil {
-		return days, nil
-	}
-
-	days, err = n.fsCtx.gmail.PopulatedDays(ctx, n.label.ID, n.year, n.month, n.fsCtx.cache)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := n.fsCtx.cache.SetPopulatedDays(n.label.ID, n.year, n.month, days); err != nil {
-		slog.Warn("cache write error", slog.Any("err", err))
-	}
-	return days, nil
+	return n.fsCtx.index.Days(ctx, n.label.ID, n.year, n.month)
 }
 
 func (n *monthNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
@@ -319,20 +281,7 @@ func (n *dayNode) OpendirHandle(_ context.Context, _ uint32) (fs.FileHandle, uin
 }
 
 func (n *dayNode) getDayStubs(ctx context.Context) ([]MessageStub, error) {
-	stubs, err := n.fsCtx.cache.GetDayListing(n.label.ID, n.year, n.month, n.day)
-	if err == nil {
-		return stubs, nil
-	}
-
-	stubs, err = n.fsCtx.gmail.ListDayMessages(ctx, n.label.ID, n.year, n.month, n.day, n.fsCtx.cache)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := n.fsCtx.cache.SetDayListing(n.label.ID, n.year, n.month, n.day, stubs); err != nil {
-		slog.Warn("cache write error", slog.Any("err", err))
-	}
-	return stubs, nil
+	return n.fsCtx.index.DayStubs(ctx, n.label.ID, n.year, n.month, n.day)
 }
 
 func (n *dayNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {

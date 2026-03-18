@@ -30,15 +30,39 @@ func (m *mockGmail) GetMessageStubs(_ context.Context, _ []string, _ stubCache) 
 	return m.stubs, m.stubsErr
 }
 
-type flushCall struct {
+type indexCall struct {
 	method  string
 	labelID string
-	dates   []time.Time
+}
+
+type mockIndex struct {
+	*LabelIndex
+	calls []indexCall
+}
+
+func newMockIndex(t *testing.T) *mockIndex {
+	t.Helper()
+	c := newTestCache(t)
+	return &mockIndex{LabelIndex: NewLabelIndex(nil, c)}
+}
+
+func (m *mockIndex) Update(labelID string, lc *LabelChanges, stubs map[string]MessageStub) error {
+	m.calls = append(m.calls, indexCall{method: "Update", labelID: labelID})
+	return m.LabelIndex.Update(labelID, lc, stubs)
+}
+
+func (m *mockIndex) Flush(labelID string) error {
+	m.calls = append(m.calls, indexCall{method: "Flush", labelID: labelID})
+	return m.LabelIndex.Flush(labelID)
+}
+
+func (m *mockIndex) FlushAll() error {
+	m.calls = append(m.calls, indexCall{method: "FlushAll"})
+	return m.LabelIndex.FlushAll()
 }
 
 type mockCache struct {
 	*Cache
-	flushes []flushCall
 }
 
 func newMockCache(t *testing.T) *mockCache {
@@ -46,32 +70,18 @@ func newMockCache(t *testing.T) *mockCache {
 	return &mockCache{Cache: newTestCache(t)}
 }
 
-func (m *mockCache) FlushListings() error {
-	m.flushes = append(m.flushes, flushCall{method: "FlushListings"})
-	return m.Cache.FlushListings()
-}
-
-func (m *mockCache) FlushLabel(labelID string) error {
-	m.flushes = append(m.flushes, flushCall{method: "FlushLabel", labelID: labelID})
-	return m.Cache.FlushLabel(labelID)
-}
-
-func (m *mockCache) FlushDays(labelID string, dates []time.Time) error {
-	m.flushes = append(m.flushes, flushCall{method: "FlushDays", labelID: labelID, dates: dates})
-	return m.Cache.FlushDays(labelID, dates)
-}
-
 func TestSyncHistorySeed(t *testing.T) {
 	mc := newMockCache(t)
+	mi := newMockIndex(t)
 	mock := &mockGmail{
 		profile: &gmail.Profile{HistoryId: 1000},
 	}
 
-	result, err := syncHistory(context.Background(), mock, mc)
+	result, err := syncHistory(context.Background(), mock, mc, mi)
 	require.NoError(t, err)
 	require.Zero(t, result.labelDates)
 	require.False(t, result.fullFlush)
-	require.Empty(t, mc.flushes)
+	require.Empty(t, mi.calls)
 
 	id, err := mc.GetHistoryID()
 	require.NoError(t, err)
@@ -80,6 +90,7 @@ func TestSyncHistorySeed(t *testing.T) {
 
 func TestSyncHistoryExpired(t *testing.T) {
 	mc := newMockCache(t)
+	mi := newMockIndex(t)
 	require.NoError(t, mc.SetHistoryID(500))
 
 	mock := &mockGmail{
@@ -87,10 +98,10 @@ func TestSyncHistoryExpired(t *testing.T) {
 		profile:    &gmail.Profile{HistoryId: 2000},
 	}
 
-	result, err := syncHistory(context.Background(), mock, mc)
+	result, err := syncHistory(context.Background(), mock, mc, mi)
 	require.NoError(t, err)
 	require.True(t, result.fullFlush)
-	require.Equal(t, []flushCall{{method: "FlushListings"}}, mc.flushes)
+	require.Equal(t, []indexCall{{method: "FlushAll"}}, mi.calls)
 
 	id, err := mc.GetHistoryID()
 	require.NoError(t, err)
@@ -99,6 +110,7 @@ func TestSyncHistoryExpired(t *testing.T) {
 
 func TestSyncHistoryNoChanges(t *testing.T) {
 	mc := newMockCache(t)
+	mi := newMockIndex(t)
 	require.NoError(t, mc.SetHistoryID(500))
 
 	mock := &mockGmail{
@@ -110,10 +122,10 @@ func TestSyncHistoryNoChanges(t *testing.T) {
 		},
 	}
 
-	result, err := syncHistory(context.Background(), mock, mc)
+	result, err := syncHistory(context.Background(), mock, mc, mi)
 	require.NoError(t, err)
 	require.Nil(t, result.labelDates)
-	require.Empty(t, mc.flushes)
+	require.Empty(t, mi.calls)
 
 	id, err := mc.GetHistoryID()
 	require.NoError(t, err)
@@ -122,6 +134,7 @@ func TestSyncHistoryNoChanges(t *testing.T) {
 
 func TestSyncHistoryLabelAddition(t *testing.T) {
 	mc := newMockCache(t)
+	mi := newMockIndex(t)
 	require.NoError(t, mc.SetHistoryID(500))
 
 	ts := time.Date(2026, 2, 27, 12, 0, 0, 0, time.Local)
@@ -129,7 +142,8 @@ func TestSyncHistoryLabelAddition(t *testing.T) {
 		changes: &HistoryChanges{
 			Labels: map[string]*LabelChanges{
 				"INBOX": {
-					MessageIDs: map[string]bool{"msg1": true},
+					Added:   map[string]bool{"msg1": true},
+					Removed: map[string]bool{},
 				},
 			},
 			Added:        map[string]bool{},
@@ -141,54 +155,109 @@ func TestSyncHistoryLabelAddition(t *testing.T) {
 		},
 	}
 
-	result, err := syncHistory(context.Background(), mock, mc)
+	result, err := syncHistory(context.Background(), mock, mc, mi)
 	require.NoError(t, err)
 	require.Contains(t, result.labelDates, "INBOX")
 	require.Len(t, result.labelDates["INBOX"], 1)
 
-	require.Len(t, mc.flushes, 1)
-	require.Equal(t, "FlushDays", mc.flushes[0].method)
-	require.Equal(t, "INBOX", mc.flushes[0].labelID)
-	require.Len(t, mc.flushes[0].dates, 1)
+	// Should have Update calls for INBOX and All Mail.
+	var inboxUpdate, allMailUpdate bool
+	for _, c := range mi.calls {
+		if c.method == "Update" && c.labelID == "INBOX" {
+			inboxUpdate = true
+		}
+		if c.method == "Update" && c.labelID == AllMailLabelID {
+			allMailUpdate = true
+		}
+	}
+	require.True(t, inboxUpdate)
+	require.True(t, allMailUpdate)
 }
 
-func TestSyncHistoryDeletion(t *testing.T) {
+func TestSyncHistoryDeletionUnresolvable(t *testing.T) {
 	mc := newMockCache(t)
+	mi := newMockIndex(t)
 	require.NoError(t, mc.SetHistoryID(500))
 
+	// No stubs available — deletion is unresolvable.
 	mock := &mockGmail{
 		changes: &HistoryChanges{
 			Labels: map[string]*LabelChanges{
 				"INBOX": {
-					MessageIDs: map[string]bool{"msg1": true},
-					HasDeleted: true,
+					Added:   map[string]bool{},
+					Removed: map[string]bool{"msg1": true},
 				},
 			},
 			Added:        map[string]bool{},
-			Deleted:      map[string]bool{},
+			Deleted:      map[string]bool{"msg1": true},
 			NewHistoryID: 600,
 		},
 	}
 
-	result, err := syncHistory(context.Background(), mock, mc)
+	result, err := syncHistory(context.Background(), mock, mc, mi)
 	require.NoError(t, err)
 	require.Contains(t, result.labelDates, "INBOX")
 	require.Nil(t, result.labelDates["INBOX"])
 
-	require.Len(t, mc.flushes, 1)
-	require.Equal(t, "FlushLabel", mc.flushes[0].method)
-	require.Equal(t, "INBOX", mc.flushes[0].labelID)
+	// INBOX gets Flush (unresolvable deletion).
+	var inboxFlush bool
+	for _, c := range mi.calls {
+		if c.method == "Flush" && c.labelID == "INBOX" {
+			inboxFlush = true
+		}
+	}
+	require.True(t, inboxFlush)
+}
+
+func TestSyncHistoryDeletionResolvable(t *testing.T) {
+	mc := newMockCache(t)
+	mi := newMockIndex(t)
+	require.NoError(t, mc.SetHistoryID(500))
+
+	ts := time.Date(2026, 2, 27, 12, 0, 0, 0, time.Local)
+	// Stub is available (e.g. from cache) — deletion can be resolved to a date.
+	mock := &mockGmail{
+		changes: &HistoryChanges{
+			Labels: map[string]*LabelChanges{
+				"INBOX": {
+					Added:   map[string]bool{},
+					Removed: map[string]bool{"msg1": true},
+				},
+			},
+			Added:        map[string]bool{},
+			Deleted:      map[string]bool{"msg1": true},
+			NewHistoryID: 600,
+		},
+		stubs: map[string]MessageStub{
+			"msg1": {ID: "msg1", InternalDate: ts.UnixMilli(), Subject: "Deleted"},
+		},
+	}
+
+	result, err := syncHistory(context.Background(), mock, mc, mi)
+	require.NoError(t, err)
+
+	// INBOX should get targeted dates, NOT a flush.
+	require.Contains(t, result.labelDates, "INBOX")
+	require.Len(t, result.labelDates["INBOX"], 1)
+
+	for _, c := range mi.calls {
+		if c.labelID == "INBOX" {
+			require.Equal(t, "Update", c.method, "INBOX should only get Update, not Flush")
+		}
+	}
 }
 
 func TestSyncHistoryHiddenLabelsSkipped(t *testing.T) {
 	mc := newMockCache(t)
+	mi := newMockIndex(t)
 	require.NoError(t, mc.SetHistoryID(500))
 
 	mock := &mockGmail{
 		changes: &HistoryChanges{
 			Labels: map[string]*LabelChanges{
 				"UNREAD": {
-					MessageIDs: map[string]bool{"msg1": true},
+					Added:   map[string]bool{"msg1": true},
+					Removed: map[string]bool{},
 				},
 			},
 			Added:        map[string]bool{},
@@ -200,14 +269,19 @@ func TestSyncHistoryHiddenLabelsSkipped(t *testing.T) {
 		},
 	}
 
-	result, err := syncHistory(context.Background(), mock, mc)
+	result, err := syncHistory(context.Background(), mock, mc, mi)
 	require.NoError(t, err)
 	require.NotContains(t, result.labelDates, "UNREAD")
-	require.Empty(t, mc.flushes)
+
+	// Only All Mail Update should be present (no UNREAD calls).
+	for _, c := range mi.calls {
+		require.NotEqual(t, "UNREAD", c.labelID)
+	}
 }
 
 func TestSyncHistoryAllMailAdded(t *testing.T) {
 	mc := newMockCache(t)
+	mi := newMockIndex(t)
 	require.NoError(t, mc.SetHistoryID(500))
 
 	ts := time.Date(2026, 2, 27, 12, 0, 0, 0, time.Local)
@@ -215,7 +289,8 @@ func TestSyncHistoryAllMailAdded(t *testing.T) {
 		changes: &HistoryChanges{
 			Labels: map[string]*LabelChanges{
 				"INBOX": {
-					MessageIDs: map[string]bool{"msg1": true},
+					Added:   map[string]bool{"msg1": true},
+					Removed: map[string]bool{},
 				},
 			},
 			Added:        map[string]bool{"msg1": true},
@@ -227,62 +302,47 @@ func TestSyncHistoryAllMailAdded(t *testing.T) {
 		},
 	}
 
-	result, err := syncHistory(context.Background(), mock, mc)
+	result, err := syncHistory(context.Background(), mock, mc, mi)
 	require.NoError(t, err)
 	require.Contains(t, result.labelDates, AllMailLabelID)
-
-	// Should have FlushDays for INBOX and FlushDays for All Mail.
-	var allMailFlush *flushCall
-	for i := range mc.flushes {
-		if mc.flushes[i].labelID == AllMailLabelID {
-			allMailFlush = &mc.flushes[i]
-		}
-	}
-	require.NotNil(t, allMailFlush)
-	require.Equal(t, "FlushDays", allMailFlush.method)
-	require.Len(t, allMailFlush.dates, 1)
+	require.Len(t, result.labelDates[AllMailLabelID], 1)
 }
 
 func TestSyncHistoryAllMailDeleted(t *testing.T) {
 	mc := newMockCache(t)
+	mi := newMockIndex(t)
 	require.NoError(t, mc.SetHistoryID(500))
 
 	ts := time.Date(2026, 2, 27, 12, 0, 0, 0, time.Local)
-	// Pre-cache the stub so deleted message date can be resolved.
-	require.NoError(t, mc.SetMessageStub(MessageStub{ID: "msg1", InternalDate: ts.UnixMilli()}))
-
+	// Stub is resolvable (e.g. from cache) — date can be determined.
 	mock := &mockGmail{
 		changes: &HistoryChanges{
 			Labels: map[string]*LabelChanges{
 				"INBOX": {
-					MessageIDs: map[string]bool{"msg1": true},
-					HasDeleted: true,
+					Added:   map[string]bool{},
+					Removed: map[string]bool{"msg1": true},
 				},
 			},
 			Added:        map[string]bool{},
 			Deleted:      map[string]bool{"msg1": true},
 			NewHistoryID: 600,
 		},
+		stubs: map[string]MessageStub{
+			"msg1": {ID: "msg1", InternalDate: ts.UnixMilli()},
+		},
 	}
 
-	result, err := syncHistory(context.Background(), mock, mc)
+	result, err := syncHistory(context.Background(), mock, mc, mi)
 	require.NoError(t, err)
 
-	// All Mail should get FlushDays (not FlushLabel) since stub was resolvable.
-	var allMailFlush *flushCall
-	for i := range mc.flushes {
-		if mc.flushes[i].labelID == AllMailLabelID {
-			allMailFlush = &mc.flushes[i]
-		}
-	}
-	require.NotNil(t, allMailFlush)
-	require.Equal(t, "FlushDays", allMailFlush.method)
-	require.Len(t, allMailFlush.dates, 1)
+	// All Mail should get dates (not a full flush) since stub was resolvable.
 	require.Contains(t, result.labelDates, AllMailLabelID)
+	require.Len(t, result.labelDates[AllMailLabelID], 1)
 }
 
 func TestSyncHistoryAllMailUnresolvableDeletion(t *testing.T) {
 	mc := newMockCache(t)
+	mi := newMockIndex(t)
 	require.NoError(t, mc.SetHistoryID(500))
 
 	// No cached stub for msg1 — date can't be resolved.
@@ -290,8 +350,8 @@ func TestSyncHistoryAllMailUnresolvableDeletion(t *testing.T) {
 		changes: &HistoryChanges{
 			Labels: map[string]*LabelChanges{
 				"INBOX": {
-					MessageIDs: map[string]bool{"msg1": true},
-					HasDeleted: true,
+					Added:   map[string]bool{},
+					Removed: map[string]bool{"msg1": true},
 				},
 			},
 			Added:        map[string]bool{},
@@ -300,17 +360,93 @@ func TestSyncHistoryAllMailUnresolvableDeletion(t *testing.T) {
 		},
 	}
 
-	result, err := syncHistory(context.Background(), mock, mc)
+	result, err := syncHistory(context.Background(), mock, mc, mi)
 	require.NoError(t, err)
 
-	// All Mail should get FlushLabel since stub was unresolvable.
-	var allMailFlush *flushCall
-	for i := range mc.flushes {
-		if mc.flushes[i].labelID == AllMailLabelID {
-			allMailFlush = &mc.flushes[i]
+	// All Mail should get Flush since stub was unresolvable.
+	var allMailFlush bool
+	for _, c := range mi.calls {
+		if c.method == "Flush" && c.labelID == AllMailLabelID {
+			allMailFlush = true
 		}
 	}
-	require.NotNil(t, allMailFlush)
-	require.Equal(t, "FlushLabel", allMailFlush.method)
+	require.True(t, allMailFlush)
 	require.Nil(t, result.labelDates[AllMailLabelID])
+}
+
+func TestSyncHistoryUpdatesIndex(t *testing.T) {
+	mc := newMockCache(t)
+	mi := newMockIndex(t)
+	require.NoError(t, mc.SetHistoryID(500))
+
+	// Pre-populate an index for INBOX.
+	ts1 := time.Date(2026, 2, 15, 10, 0, 0, 0, time.Local)
+	require.NoError(t, mc.SetMessageStub(MessageStub{ID: "existing1", InternalDate: ts1.UnixMilli(), Subject: "Old"}))
+	require.NoError(t, mi.cache.SetDayIndex("INBOX", 2026, 2, 15, []string{"existing1"}))
+	require.NoError(t, mi.cache.SetLabelIndexComplete("INBOX"))
+
+	ts2 := time.Date(2026, 2, 15, 14, 0, 0, 0, time.Local)
+	mock := &mockGmail{
+		changes: &HistoryChanges{
+			Labels: map[string]*LabelChanges{
+				"INBOX": {
+					Added:   map[string]bool{"msg2": true},
+					Removed: map[string]bool{},
+				},
+			},
+			Added:        map[string]bool{},
+			Deleted:      map[string]bool{},
+			NewHistoryID: 600,
+		},
+		stubs: map[string]MessageStub{
+			"msg2": {ID: "msg2", InternalDate: ts2.UnixMilli(), Subject: "New"},
+		},
+	}
+
+	_, err := syncHistory(context.Background(), mock, mc, mi)
+	require.NoError(t, err)
+
+	// Index should now contain both messages.
+	ids, ierr := mi.cache.GetDayIndex("INBOX", 2026, 2, 15)
+	require.NoError(t, ierr)
+	require.ElementsMatch(t, []string{"existing1", "msg2"}, ids)
+	require.True(t, mi.cache.IsLabelIndexComplete("INBOX"))
+}
+
+func TestSyncHistoryRemovesFromIndex(t *testing.T) {
+	mc := newMockCache(t)
+	mi := newMockIndex(t)
+	require.NoError(t, mc.SetHistoryID(500))
+
+	ts := time.Date(2026, 2, 15, 10, 0, 0, 0, time.Local)
+	require.NoError(t, mc.SetMessageStub(MessageStub{ID: "msg1", InternalDate: ts.UnixMilli(), Subject: "Old"}))
+	require.NoError(t, mc.SetMessageStub(MessageStub{ID: "msg2", InternalDate: ts.UnixMilli(), Subject: "Keep"}))
+	require.NoError(t, mi.cache.SetDayIndex("INBOX", 2026, 2, 15, []string{"msg1", "msg2"}))
+	require.NoError(t, mi.cache.SetLabelIndexComplete("INBOX"))
+
+	// msg1 removed from INBOX (label removed, not globally deleted).
+	mock := &mockGmail{
+		changes: &HistoryChanges{
+			Labels: map[string]*LabelChanges{
+				"INBOX": {
+					Added:   map[string]bool{},
+					Removed: map[string]bool{"msg1": true},
+				},
+			},
+			Added:        map[string]bool{},
+			Deleted:      map[string]bool{},
+			NewHistoryID: 600,
+		},
+		stubs: map[string]MessageStub{
+			"msg1": {ID: "msg1", InternalDate: ts.UnixMilli(), Subject: "Old"},
+		},
+	}
+
+	_, err := syncHistory(context.Background(), mock, mc, mi)
+	require.NoError(t, err)
+
+	ids, ierr := mi.cache.GetDayIndex("INBOX", 2026, 2, 15)
+	require.NoError(t, ierr)
+	require.Equal(t, []string{"msg2"}, ids)
+	require.True(t, mi.cache.IsLabelIndexComplete("INBOX"))
 }

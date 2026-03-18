@@ -12,9 +12,6 @@ type historyCache interface {
 	stubCache
 	GetHistoryID() (uint64, error)
 	SetHistoryID(uint64) error
-	FlushListings() error
-	FlushLabel(string) error
-	FlushDays(string, []time.Time) error
 }
 
 type syncResult struct {
@@ -27,7 +24,52 @@ type syncResult struct {
 	labelsChanged bool
 }
 
-func syncHistory(ctx context.Context, gmail historySyncer, cache historyCache) (syncResult, error) {
+// resolveAffectedDates returns the local dates affected by the given label
+// changes. For added messages, missing stubs are silently skipped (the message
+// date is unknown but harmless). For removed messages, a missing stub means we
+// can't determine which date to invalidate, so ok is false.
+func resolveAffectedDates(lc *LabelChanges, stubs map[string]MessageStub) (dates []time.Time, ok bool) {
+	for msgID := range lc.Added {
+		if s, found := stubs[msgID]; found {
+			dates = append(dates, time.UnixMilli(s.InternalDate).In(time.Local))
+		}
+	}
+	for msgID := range lc.Removed {
+		s, found := stubs[msgID]
+		if !found {
+			return nil, false
+		}
+		dates = append(dates, time.UnixMilli(s.InternalDate).In(time.Local))
+	}
+	return dates, true
+}
+
+// processLabelChanges resolves affected dates and updates the day index for a
+// single label. When a removed message's stub can't be resolved, the entire
+// label is flushed.
+func processLabelChanges(labelID string, lc *LabelChanges, stubs map[string]MessageStub, index indexUpdater, result *syncResult) error {
+	dates, ok := resolveAffectedDates(lc, stubs)
+	if !ok {
+		slog.Info("flushing label (unresolvable deletion)", slog.String("label", labelID))
+		if err := index.Flush(labelID); err != nil {
+			return fmt.Errorf("flushing label %s: %w", labelID, err)
+		}
+		result.labelDates[labelID] = nil
+	} else if len(dates) > 0 {
+		result.labelDates[labelID] = dates
+	}
+
+	if err := index.Update(labelID, lc, stubs); err != nil {
+		slog.Warn("index update failed, flushing",
+			slog.String("label", labelID), slog.Any("err", err))
+		if ferr := index.Flush(labelID); ferr != nil {
+			slog.Error("flush index failed", slog.String("label", labelID), slog.Any("err", ferr))
+		}
+	}
+	return nil
+}
+
+func syncHistory(ctx context.Context, gmail historySyncer, cache historyCache, index indexUpdater) (syncResult, error) {
 	storedID, err := cache.GetHistoryID()
 	if err != nil {
 		return syncResult{}, err
@@ -46,7 +88,7 @@ func syncHistory(ctx context.Context, gmail historySyncer, cache historyCache) (
 	changes, err := gmail.SyncHistory(ctx, storedID)
 	if errors.Is(err, ErrHistoryExpired) {
 		slog.Warn("history expired, flushing all caches")
-		if err := cache.FlushListings(); err != nil {
+		if err := index.FlushAll(); err != nil {
 			return syncResult{}, err
 		}
 
@@ -65,17 +107,20 @@ func syncHistory(ctx context.Context, gmail historySyncer, cache historyCache) (
 		slog.Info("history sync", slog.Int("affectedLabels", len(changes.Labels)), slog.Uint64("newHistoryId", changes.NewHistoryID))
 		result.labelDates = make(map[string][]time.Time)
 
-		// Collect all unique message IDs from labels that don't have deletions,
-		// plus globally added messages (for All Mail resolution).
+		// Collect all unique message IDs that need stub resolution.
 		allIDs := make(map[string]bool)
 		for _, lc := range changes.Labels {
-			if !lc.HasDeleted {
-				for id := range lc.MessageIDs {
-					allIDs[id] = true
-				}
+			for id := range lc.Added {
+				allIDs[id] = true
+			}
+			for id := range lc.Removed {
+				allIDs[id] = true
 			}
 		}
 		for id := range changes.Added {
+			allIDs[id] = true
+		}
+		for id := range changes.Deleted {
 			allIDs[id] = true
 		}
 
@@ -91,69 +136,24 @@ func syncHistory(ctx context.Context, gmail historySyncer, cache historyCache) (
 			}
 		}
 
+		// Process per-label changes.
 		for labelID, lc := range changes.Labels {
 			if hiddenLabels[labelID] {
 				continue
 			}
-			if lc.HasDeleted {
-				slog.Info("flushing entire label (has deletions)", slog.String("label", labelID))
-				if err := cache.FlushLabel(labelID); err != nil {
-					return syncResult{}, fmt.Errorf("flushing label %s: %w", labelID, err)
-				}
-				result.labelDates[labelID] = nil
-				continue
-			}
-			var affectedDates []time.Time
-			for msgID := range lc.MessageIDs {
-				if s, ok := stubs[msgID]; ok {
-					affectedDates = append(affectedDates, time.UnixMilli(s.InternalDate).In(time.Local))
-				}
-			}
-			if len(affectedDates) > 0 {
-				slog.Info("flushing specific days", slog.String("label", labelID), slog.Int("days", len(affectedDates)))
-				if err := cache.FlushDays(labelID, affectedDates); err != nil {
-					return syncResult{}, fmt.Errorf("flushing days for label %s: %w", labelID, err)
-				}
-				result.labelDates[labelID] = affectedDates
+			if err := processLabelChanges(labelID, lc, stubs, index, &result); err != nil {
+				return syncResult{}, err
 			}
 		}
 
-		// Compute "All Mail" invalidation using only MessagesAdded/MessagesDeleted
-		// events — LabelsAdded/LabelsRemoved don't change All Mail's content.
-		var allMailDates []time.Time
-		fullFlushAllMail := false
-
-		// Deleted messages: resolve dates from stub cache (stubs are immutable
-		// and survive message deletion). If any can't be resolved, full flush.
-		for msgID := range changes.Deleted {
-			stub, cerr := cache.GetMessageStub(msgID)
-			if cerr != nil {
-				fullFlushAllMail = true
-				break
-			}
-			allMailDates = append(allMailDates, time.UnixMilli(stub.InternalDate).In(time.Local))
+		// All Mail uses MessagesAdded/MessagesDeleted events only —
+		// LabelsAdded/LabelsRemoved don't change All Mail's content.
+		allMailLC := &LabelChanges{
+			Added:   changes.Added,
+			Removed: changes.Deleted,
 		}
-
-		if !fullFlushAllMail {
-			for msgID := range changes.Added {
-				if s, ok := stubs[msgID]; ok {
-					allMailDates = append(allMailDates, time.UnixMilli(s.InternalDate).In(time.Local))
-				}
-			}
-		}
-
-		if fullFlushAllMail {
-			slog.Info("flushing All Mail (unresolvable deletion)")
-			if err := cache.FlushLabel(AllMailLabelID); err != nil {
-				return syncResult{}, fmt.Errorf("flushing All Mail: %w", err)
-			}
-			result.labelDates[AllMailLabelID] = nil
-		} else if len(allMailDates) > 0 {
-			slog.Info("flushing All Mail specific days", slog.Int("days", len(allMailDates)))
-			if err := cache.FlushDays(AllMailLabelID, allMailDates); err != nil {
-				return syncResult{}, fmt.Errorf("flushing All Mail days: %w", err)
-			}
-			result.labelDates[AllMailLabelID] = allMailDates
+		if err := processLabelChanges(AllMailLabelID, allMailLC, stubs, index, &result); err != nil {
+			return syncResult{}, err
 		}
 	}
 	return result, cache.SetHistoryID(changes.NewHistoryID)
@@ -167,7 +167,7 @@ func historySyncLoop(ctx context.Context, fsCtx *fsContext, interval time.Durati
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			result, err := syncHistory(ctx, fsCtx.gmail, fsCtx.cache)
+			result, err := syncHistory(ctx, fsCtx.gmail, fsCtx.cache, fsCtx.index)
 			if err != nil {
 				if ctx.Err() != nil {
 					return
@@ -218,7 +218,7 @@ func syncLabels(fsCtx *fsContext, newLabels []LabelInfo) bool {
 	for id := range oldByID {
 		if _, ok := newByID[id]; !ok {
 			slog.Info("label removed", slog.String("label", id), slog.String("name", oldByID[id]))
-			if err := fsCtx.cache.FlushLabel(id); err != nil {
+			if err := fsCtx.index.Flush(id); err != nil {
 				slog.Error("flushing removed label", slog.String("label", id), slog.Any("err", err))
 			}
 		}

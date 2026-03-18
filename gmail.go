@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -138,63 +137,7 @@ func (g *GmailClient) ListLabels(ctx context.Context) ([]LabelInfo, error) {
 	return labels, nil
 }
 
-func dayBounds(year, month, day int) (int64, int64) {
-	start := time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.Local)
-	end := start.AddDate(0, 0, 1)
-	return start.Unix(), end.Unix()
-}
-
-func yearBounds(year int) (int64, int64) {
-	start := time.Date(year, 1, 1, 0, 0, 0, 0, time.Local)
-	end := time.Date(year+1, 1, 1, 0, 0, 0, 0, time.Local)
-	return start.Unix(), end.Unix()
-}
-
-func monthBounds(year, month int) (int64, int64) {
-	start := time.Date(year, time.Month(month), 1, 0, 0, 0, 0, time.Local)
-	end := start.AddDate(0, 1, 0)
-	return start.Unix(), end.Unix()
-}
-
-func (g *GmailClient) newestMessageInRange(ctx context.Context, labelID string, afterEpoch, beforeEpoch int64, cache *Cache) (MessageStub, bool, error) {
-	if err := g.limiter.Wait(ctx); err != nil {
-		return MessageStub{}, false, err
-	}
-
-	var query string
-	if afterEpoch > 0 {
-		query = fmt.Sprintf("after:%d before:%d", afterEpoch, beforeEpoch)
-	} else {
-		query = fmt.Sprintf("before:%d", beforeEpoch)
-	}
-	slog.Debug("gmail API", slog.String("method", "messages.list"), slog.String("label", labelID), slog.String("q", query))
-	req := g.messagesList(labelID).
-		Q(query).
-		MaxResults(1).
-		Context(ctx)
-	resp, err := req.Do()
-	if err != nil {
-		return MessageStub{}, false, fmt.Errorf("listing newest message: %w", err)
-	}
-
-	if len(resp.Messages) == 0 {
-		return MessageStub{}, false, nil
-	}
-
-	stubs, err := g.GetMessageStubs(ctx, []string{resp.Messages[0].Id}, cache)
-	if err != nil {
-		return MessageStub{}, false, err
-	}
-
-	stub, ok := stubs[resp.Messages[0].Id]
-	if !ok {
-		return MessageStub{}, false, nil
-	}
-	return stub, true, nil
-}
-
-func (g *GmailClient) listMessageIDs(ctx context.Context, labelID string, afterEpoch, beforeEpoch int64) ([]string, error) {
-	query := fmt.Sprintf("after:%d before:%d", afterEpoch, beforeEpoch)
+func (g *GmailClient) listMessages(ctx context.Context, labelID, query string) ([]string, error) {
 	var allIDs []string
 	pageToken := ""
 	for {
@@ -204,9 +147,11 @@ func (g *GmailClient) listMessageIDs(ctx context.Context, labelID string, afterE
 
 		slog.Debug("gmail API", slog.String("method", "messages.list"), slog.String("label", labelID), slog.String("q", query))
 		req := g.messagesList(labelID).
-			Q(query).
 			MaxResults(500).
 			Context(ctx)
+		if query != "" {
+			req = req.Q(query)
+		}
 		if pageToken != "" {
 			req = req.PageToken(pageToken)
 		}
@@ -221,109 +166,14 @@ func (g *GmailClient) listMessageIDs(ctx context.Context, labelID string, afterE
 		if resp.NextPageToken == "" {
 			break
 		}
+		slog.Info("listing messages", slog.String("label", labelID), slog.Int("fetched", len(allIDs)))
 		pageToken = resp.NextPageToken
 	}
 	return allIDs, nil
 }
 
-// Cost: O(populated_years + 1) API calls.
-func (g *GmailClient) PopulatedYears(ctx context.Context, labelID string, cache *Cache) ([]int, error) {
-	var years []int
-	cursor := time.Now().AddDate(1, 0, 0).Unix()
-	for {
-		s, found, err := g.newestMessageInRange(ctx, labelID, 0, cursor, cache)
-		if err != nil {
-			return nil, err
-		}
-
-		if !found {
-			break
-		}
-
-		y := time.UnixMilli(s.InternalDate).In(time.Local).Year()
-		years = append(years, y)
-		cursor = time.Date(y, 1, 1, 0, 0, 0, 0, time.Local).Unix()
-	}
-
-	slices.Reverse(years)
-	return years, nil
-}
-
-// Cost: O(populated_months + 1) API calls.
-func (g *GmailClient) PopulatedMonths(ctx context.Context, labelID string, year int, cache *Cache) ([]int, error) {
-	_, endOfYear := yearBounds(year)
-	cursor := endOfYear
-	startOfYear, _ := yearBounds(year)
-
-	var months []int
-	for {
-		s, found, err := g.newestMessageInRange(ctx, labelID, startOfYear, cursor, cache)
-		if err != nil {
-			return nil, err
-		}
-
-		if !found {
-			break
-		}
-
-		m := int(time.UnixMilli(s.InternalDate).In(time.Local).Month())
-		months = append(months, m)
-		mStart, _ := monthBounds(year, m)
-		cursor = mStart
-	}
-
-	slices.Reverse(months)
-	return months, nil
-}
-
-// Cost: O(populated_days + 1) API calls.
-func (g *GmailClient) PopulatedDays(ctx context.Context, labelID string, year, month int, cache *Cache) ([]int, error) {
-	_, endOfMonth := monthBounds(year, month)
-	cursor := endOfMonth
-	startOfMonth, _ := monthBounds(year, month)
-
-	var days []int
-	for {
-		s, found, err := g.newestMessageInRange(ctx, labelID, startOfMonth, cursor, cache)
-		if err != nil {
-			return nil, err
-		}
-
-		if !found {
-			break
-		}
-
-		d := time.UnixMilli(s.InternalDate).In(time.Local).Day()
-		days = append(days, d)
-		dStart, _ := dayBounds(year, month, d)
-		cursor = dStart
-	}
-
-	slices.Reverse(days)
-	return days, nil
-}
-
-func (g *GmailClient) ListDayMessages(ctx context.Context, labelID string, year, month, day int, cache *Cache) ([]MessageStub, error) {
-	start, end := dayBounds(year, month, day)
-
-	allIDs, err := g.listMessageIDs(ctx, labelID, start, end)
-	if err != nil {
-		return nil, err
-	}
-
-	stubMap, err := g.GetMessageStubs(ctx, allIDs, cache)
-	if err != nil {
-		return nil, err
-	}
-
-	stubs := make([]MessageStub, 0, len(allIDs))
-	for _, id := range allIDs {
-		if s, ok := stubMap[id]; ok {
-			stubs = append(stubs, s)
-		}
-	}
-	sort.Slice(stubs, func(i, j int) bool { return stubs[i].InternalDate < stubs[j].InternalDate })
-	return stubs, nil
+func (g *GmailClient) ListAllMessageIDs(ctx context.Context, labelID string) ([]string, error) {
+	return g.listMessages(ctx, labelID, "")
 }
 
 func (g *GmailClient) GetRawMessage(ctx context.Context, messageID string) ([]byte, error) {
@@ -365,8 +215,8 @@ func (g *GmailClient) GetProfile(ctx context.Context) (*gmail.Profile, error) {
 var ErrHistoryExpired = errors.New("history ID expired")
 
 type LabelChanges struct {
-	MessageIDs map[string]bool
-	HasDeleted bool
+	Added   map[string]bool
+	Removed map[string]bool
 }
 
 type HistoryChanges struct {
@@ -379,7 +229,10 @@ type HistoryChanges struct {
 func getOrCreateLabelChanges(m map[string]*LabelChanges, labelID string) *LabelChanges {
 	lc := m[labelID]
 	if lc == nil {
-		lc = &LabelChanges{MessageIDs: make(map[string]bool)}
+		lc = &LabelChanges{
+			Added:   make(map[string]bool),
+			Removed: make(map[string]bool),
+		}
 		m[labelID] = lc
 	}
 	return lc
@@ -426,27 +279,26 @@ func (g *GmailClient) SyncHistory(ctx context.Context, startHistoryId uint64) (*
 				changes.Added[added.Message.Id] = true
 				for _, lid := range added.Message.LabelIds {
 					lc := getOrCreateLabelChanges(changes.Labels, lid)
-					lc.MessageIDs[added.Message.Id] = true
+					lc.Added[added.Message.Id] = true
 				}
 			}
 			for _, removed := range h.MessagesDeleted {
 				changes.Deleted[removed.Message.Id] = true
 				for _, lid := range removed.Message.LabelIds {
 					lc := getOrCreateLabelChanges(changes.Labels, lid)
-					lc.MessageIDs[removed.Message.Id] = true
-					lc.HasDeleted = true
+					lc.Removed[removed.Message.Id] = true
 				}
 			}
 			for _, la := range h.LabelsAdded {
 				for _, lid := range la.LabelIds {
 					lc := getOrCreateLabelChanges(changes.Labels, lid)
-					lc.MessageIDs[la.Message.Id] = true
+					lc.Added[la.Message.Id] = true
 				}
 			}
 			for _, lr := range h.LabelsRemoved {
 				for _, lid := range lr.LabelIds {
 					lc := getOrCreateLabelChanges(changes.Labels, lid)
-					lc.MessageIDs[lr.Message.Id] = true
+					lc.Removed[lr.Message.Id] = true
 				}
 			}
 		}
@@ -474,9 +326,17 @@ func (g *GmailClient) GetMessageStubs(ctx context.Context, messageIDs []string, 
 		uncached = append(uncached, id)
 	}
 
+	if len(uncached) > 0 {
+		slog.Info("fetching message metadata",
+			slog.Int("total", len(messageIDs)),
+			slog.Int("cached", len(messageIDs)-len(uncached)),
+			slog.Int("to_fetch", len(uncached)))
+	}
+
 	var (
 		mu       sync.Mutex
 		firstErr error
+		fetched  int
 	)
 	var wg sync.WaitGroup
 	for _, id := range uncached {
@@ -530,7 +390,14 @@ func (g *GmailClient) GetMessageStubs(ctx context.Context, messageIDs []string, 
 			}
 			mu.Lock()
 			stubs[id] = stub
+			fetched++
+			n := fetched
 			mu.Unlock()
+
+			if n%500 == 0 {
+				slog.Info("fetching message metadata",
+					slog.Int("fetched", n), slog.Int("total", len(uncached)))
+			}
 
 			if cache != nil {
 				if cerr := cache.SetMessageStub(stub); cerr != nil {

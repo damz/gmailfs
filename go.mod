@@ -6,6 +6,7 @@ require (
 	github.com/cockroachdb/pebble/v2 v2.1.4
 	github.com/hanwen/go-fuse/v2 v2.9.0
 	github.com/stretchr/testify v1.11.1
+	github.com/urfave/cli/v3 v3.7.0
 	golang.org/x/oauth2 v0.35.0
 	golang.org/x/sync v0.19.0
 	golang.org/x/text v0.34.0

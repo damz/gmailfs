@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"log/slog"
 	"math"
@@ -12,75 +11,65 @@ import (
 	"syscall"
 	"time"
 
+	cli "github.com/urfave/cli/v3"
+
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
 )
 
-func run() error {
-	mountpoint := flag.String("mountpoint", "", "FUSE mount point (required)")
-	cacheDir := flag.String("cache-dir", "", "PebbleDB cache directory (default: ~/.cache/gmailfs)")
-	configDir := flag.String("config-dir", "", "Config directory for credentials/token (default: ~/.config/gmailfs)")
-	debug := flag.Bool("debug", false, "Enable debug logging")
-	fuseDebug := flag.Bool("fuse-debug", false, "Enable FUSE debug logging")
-	syncInterval := flag.Duration("sync-interval", 30*time.Second, "History sync polling interval")
-	flag.Parse()
+type app struct {
+	gmail  *GmailClient
+	cache  *Cache
+	index  *LabelIndex
+	labels []LabelInfo
+}
 
-	if *mountpoint == "" {
-		fmt.Fprintln(os.Stderr, "usage: gmailfs -mountpoint <path> [-cache-dir <path>] [-config-dir <path>] [-debug] [-fuse-debug]")
-		os.Exit(1)
-	}
-
-	if *debug {
-		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	}
-
+func newApp(ctx context.Context, cacheDir, configDir string) (_ *app, retErr error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return fmt.Errorf("cannot determine home directory: %w", err)
+		return nil, fmt.Errorf("cannot determine home directory: %w", err)
 	}
 
-	if *cacheDir == "" {
-		*cacheDir = filepath.Join(home, ".cache", "gmailfs")
+	if cacheDir == "" {
+		cacheDir = filepath.Join(home, ".cache", "gmailfs")
 	}
-	if *configDir == "" {
-		*configDir = filepath.Join(home, ".config", "gmailfs")
-	}
-
-	if err := os.MkdirAll(*mountpoint, 0o755); err != nil {
-		return fmt.Errorf("cannot create mountpoint: %w", err)
-	}
-	if err := os.MkdirAll(*cacheDir, 0o755); err != nil {
-		return fmt.Errorf("cannot create cache directory: %w", err)
-	}
-	if err := os.MkdirAll(*configDir, 0o755); err != nil {
-		return fmt.Errorf("cannot create config directory: %w", err)
+	if configDir == "" {
+		configDir = filepath.Join(home, ".config", "gmailfs")
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		return nil, fmt.Errorf("cannot create cache directory: %w", err)
+	}
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		return nil, fmt.Errorf("cannot create config directory: %w", err)
+	}
 
-	credPath := filepath.Join(*configDir, "credentials.json")
-	tokPath := filepath.Join(*configDir, "token.json")
+	credPath := filepath.Join(configDir, "credentials.json")
+	tokPath := filepath.Join(configDir, "token.json")
 	httpClient, err := getOAuth2Client(ctx, credPath, tokPath)
 	if err != nil {
-		return fmt.Errorf("OAuth2 setup failed: %w", err)
+		return nil, fmt.Errorf("OAuth2 setup failed: %w", err)
 	}
 
 	gmailClient, err := NewGmailClient(ctx, httpClient)
 	if err != nil {
-		return fmt.Errorf("gmail client init failed: %w", err)
+		return nil, fmt.Errorf("gmail client init failed: %w", err)
 	}
 
-	cache, err := NewCache(*cacheDir)
+	cache, err := NewCache(cacheDir)
 	if err != nil {
-		return fmt.Errorf("cache init failed: %w", err)
+		return nil, fmt.Errorf("cache init failed: %w", err)
 	}
-	defer func() { _ = cache.Close() }()
+	defer func() {
+		if retErr != nil {
+			_ = cache.Close()
+		}
+	}()
 
 	tz := time.Now().Location().String()
 	flushed, err := cache.CheckTimezone(tz)
 	if err != nil {
-		return fmt.Errorf("checking timezone: %w", err)
+		return nil, fmt.Errorf("checking timezone: %w", err)
 	}
 	if flushed {
 		slog.Info("timezone changed, flushed caches", slog.String("tz", tz))
@@ -88,34 +77,52 @@ func run() error {
 
 	labels, err := gmailClient.ListLabels(ctx)
 	if err != nil {
-		return fmt.Errorf("listing labels: %w", err)
+		return nil, fmt.Errorf("listing labels: %w", err)
 	}
 	if err := cache.SetLabels(labels); err != nil {
-		return fmt.Errorf("caching labels: %w", err)
+		return nil, fmt.Errorf("caching labels: %w", err)
 	}
 	slog.Info("loaded labels", slog.Int("count", len(labels)))
 
 	index := NewLabelIndex(gmailClient, cache)
 
 	if _, err := syncHistory(ctx, gmailClient, cache, index); err != nil {
-		return fmt.Errorf("history sync: %w", err)
+		return nil, fmt.Errorf("history sync: %w", err)
 	}
 
+	return &app{gmail: gmailClient, cache: cache, index: index, labels: labels}, nil
+}
+
+func runMount(ctx context.Context, cmd *cli.Command) error {
+	mountpoint := cmd.String("mountpoint")
+	if err := os.MkdirAll(mountpoint, 0o755); err != nil {
+		return fmt.Errorf("cannot create mountpoint: %w", err)
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	a, err := newApp(ctx, cmd.String("cache-dir"), cmd.String("config-dir"))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = a.cache.Close() }()
+
 	fsCtx := &fsContext{
-		gmail:  gmailClient,
-		cache:  cache,
-		labels: labels,
+		gmail:  a.gmail,
+		cache:  a.cache,
+		index:  a.index,
+		labels: a.labels,
 	}
 
 	maxTimeout := time.Duration(math.MaxInt64)
-
 	root := &rootNode{fsCtx: fsCtx}
 	opts := &fs.Options{
 		MountOptions: fuse.MountOptions{
-			AllowOther: false,
+			AllowOther: true,
 			FsName:     "gmailfs",
 			Name:       "gmailfs",
-			Debug:      *fuseDebug,
+			Debug:      cmd.Bool("fuse-debug"),
 			Options:    []string{"ro"},
 		},
 		AttrTimeout:     &maxTimeout,
@@ -123,14 +130,14 @@ func run() error {
 		NegativeTimeout: &maxTimeout,
 	}
 
-	server, err := fs.Mount(*mountpoint, root, opts)
+	server, err := fs.Mount(mountpoint, root, opts)
 	if err != nil {
 		return fmt.Errorf("mount failed: %w", err)
 	}
 	fsCtx.root = &root.Inode
-	slog.Info("mounted", slog.String("mountpoint", *mountpoint))
+	slog.Info("mounted", slog.String("mountpoint", mountpoint))
 
-	go historySyncLoop(ctx, fsCtx, *syncInterval)
+	go historySyncLoop(ctx, fsCtx, cmd.Duration("sync-interval"))
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -148,7 +155,57 @@ func run() error {
 }
 
 func main() {
-	if err := run(); err != nil {
+	root := &cli.Command{
+		Name:  "gmailfs",
+		Usage: "Gmail filesystem and sync tool",
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:  "cache-dir",
+				Usage: "PebbleDB cache directory (default: ~/.cache/gmailfs)",
+			},
+			&cli.StringFlag{
+				Name:  "config-dir",
+				Usage: "Config directory for credentials/token (default: ~/.config/gmailfs)",
+			},
+			&cli.BoolFlag{
+				Name:  "debug",
+				Usage: "enable debug logging",
+			},
+		},
+		Before: func(ctx context.Context, cmd *cli.Command) (context.Context, error) {
+			if cmd.Bool("debug") {
+				slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
+			}
+			return ctx, nil
+		},
+		Commands: []*cli.Command{
+			{
+				Name:  "mount",
+				Usage: "Mount Gmail as a FUSE filesystem",
+				Flags: []cli.Flag{
+					&cli.StringFlag{
+						Name:     "mountpoint",
+						Aliases:  []string{"m"},
+						Usage:    "FUSE mount point",
+						Required: true,
+					},
+					&cli.BoolFlag{
+						Name:  "fuse-debug",
+						Usage: "enable FUSE debug logging",
+					},
+					&cli.DurationFlag{
+						Name:  "sync-interval",
+						Value: 30 * time.Second,
+						Usage: "history sync polling interval",
+					},
+				},
+				Action: runMount,
+			},
+			syncCommand,
+		},
+	}
+
+	if err := root.Run(context.Background(), os.Args); err != nil {
 		slog.Error("fatal", slog.String("err", err.Error()))
 		os.Exit(1)
 	}
